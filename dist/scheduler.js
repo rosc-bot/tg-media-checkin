@@ -1,0 +1,452 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.DEFAULT_SCHEDULE_GAP_MINUTES = void 0;
+exports.getScheduleGapMinutes = getScheduleGapMinutes;
+exports.resolveJobTimezone = resolveJobTimezone;
+exports.resolveRunEveryDays = resolveRunEveryDays;
+exports.daysUntilNextRun = daysUntilNextRun;
+exports.loadEligibleJobs = loadEligibleJobs;
+exports.executeJob = executeJob;
+exports.refreshScheduler = refreshScheduler;
+exports.purgeOldLogs = purgeOldLogs;
+exports.reconcileOrphanedRuns = reconcileOrphanedRuns;
+exports.startScheduler = startScheduler;
+exports.getSchedulerStatus = getSchedulerStatus;
+exports.skipNextRun = skipNextRun;
+const database_1 = require("./db/database");
+const secretColumns_1 = require("./db/secretColumns");
+const runner_1 = require("./jobs/runner");
+const notify_1 = require("./jobs/notify");
+const luxon_1 = require("luxon");
+const cancellation_1 = require("./jobs/cancellation");
+const scheduler_utils_1 = require("./scheduler-utils");
+const runWarnings_1 = require("./jobs/runWarnings");
+const schedule = new Map();
+/** Node's setTimeout delay is a 32-bit signed int; larger values overflow and
+ * fire almost immediately (coerced to 1ms). See issue #25. */
+const MAX_TIMEOUT_MS = 2147483647;
+/**
+ * setTimeout for delays that may exceed Node's 32-bit limit (~24.8 days).
+ * Chains timers, re-arming until the remaining delay fits. `onTimer` is called
+ * with each armed timer handle so the caller can keep a clearable reference to
+ * the currently-pending timer.
+ */
+function armLongTimeout(delayMs, callback, onTimer) {
+    if (delayMs <= MAX_TIMEOUT_MS) {
+        onTimer(setTimeout(callback, delayMs));
+        return;
+    }
+    onTimer(setTimeout(() => armLongTimeout(delayMs - MAX_TIMEOUT_MS, callback, onTimer), MAX_TIMEOUT_MS));
+}
+exports.DEFAULT_SCHEDULE_GAP_MINUTES = 2;
+const MAX_SCHEDULE_GAP_MINUTES = 30;
+/** Minimum minutes between scheduled runs. 0 disables staggering. */
+function getScheduleGapMinutes() {
+    const row = database_1.db
+        .prepare("SELECT value FROM settings WHERE key = 'schedule_min_gap_minutes'")
+        .get();
+    if (row?.value == null || row.value === "")
+        return exports.DEFAULT_SCHEDULE_GAP_MINUTES;
+    const n = Number(row.value);
+    if (!Number.isFinite(n))
+        return exports.DEFAULT_SCHEDULE_GAP_MINUTES;
+    return Math.min(MAX_SCHEDULE_GAP_MINUTES, Math.max(0, Math.floor(n)));
+}
+// Cap on simultaneous job executions -- colliding timers queue instead of
+// thundering the Telegram client all at once.
+const MAX_CONCURRENT_JOBS = 2;
+let runningJobs = 0;
+const waitingJobs = [];
+async function acquireRunSlot() {
+    if (runningJobs < MAX_CONCURRENT_JOBS) {
+        runningJobs++;
+        return;
+    }
+    // Slot is handed over directly by releaseRunSlot, so no counter change here
+    await new Promise((resolve) => waitingJobs.push(resolve));
+}
+function releaseRunSlot() {
+    const next = waitingJobs.shift();
+    if (next)
+        next();
+    else
+        runningJobs--;
+}
+/**
+ * Resolves a job's timezone for scheduling. Empty means "follow the
+ * default_timezone setting"; invalid zones fall back rather than producing
+ * NaN timers.
+ */
+function resolveJobTimezone(jobTimezone) {
+    const tz = jobTimezone || (0, database_1.getDefaultTimezone)();
+    if (luxon_1.IANAZone.isValidZone(tz))
+        return tz;
+    const fallback = (0, database_1.getDefaultTimezone)();
+    return luxon_1.IANAZone.isValidZone(fallback) ? fallback : database_1.FALLBACK_TIMEZONE;
+}
+function checkDailyRunEnabled() {
+    const row = database_1.db
+        .prepare("SELECT value FROM settings WHERE key = 'check_daily_run'")
+        .get();
+    return row?.value !== "false";
+}
+// Small deterministic PRNG (FNV-1a hash seed -> mulberry32 step) so a run-every
+// range resolves to a value that is stable for a given seed, not re-rolled on
+// every scheduler refresh.
+function seededRandom(seed) {
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < seed.length; i++) {
+        h ^= seed.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    let a = (h + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+// Resolve the effective interval from a [min, max] range for a given seed. A
+// null/absent max (or max <= min) yields the fixed min, preserving the old
+// single-value behaviour exactly.
+function intervalFromSeed(min, max, seed) {
+    const lo = Math.max(1, Math.floor(min));
+    const hi = max != null ? Math.floor(max) : lo;
+    if (hi <= lo)
+        return lo;
+    return lo + Math.floor(seededRandom(seed) * (hi - lo + 1));
+}
+/**
+ * The interval to defer by after a run, resolved from the range. Seeded by the
+ * job's last successful run so the value stays stable across refreshes/restarts
+ * within a cycle and re-rolls only once a new successful run is recorded.
+ */
+function resolveRunEveryDays(jobId, min, max) {
+    const row = database_1.db
+        .prepare("SELECT ran_at FROM job_logs WHERE job_id = ? AND status = 'success' ORDER BY ran_at DESC LIMIT 1")
+        .get(jobId);
+    return intervalFromSeed(min, max, `${jobId}:${row?.ran_at ?? "first"}`);
+}
+function daysUntilNextRun(jobId, tz, runEveryDays, runEveryDaysMax) {
+    const row = database_1.db
+        .prepare("SELECT ran_at FROM job_logs WHERE job_id = ? AND status = 'success' ORDER BY ran_at DESC LIMIT 1")
+        .get(jobId);
+    if (!row)
+        return 0;
+    // Same seed as resolveRunEveryDays so the scheduled date is consistent whether
+    // it was set after a run or recomputed on restart.
+    const runEvery = intervalFromSeed(runEveryDays, runEveryDaysMax, `${jobId}:${row.ran_at}`);
+    const lastRun = luxon_1.DateTime.fromISO(row.ran_at, { zone: "utc" })
+        .setZone(tz)
+        .startOf("day");
+    const today = luxon_1.DateTime.now().setZone(tz).startOf("day");
+    const daysSince = Math.floor(today.diff(lastRun, "days").days);
+    return daysSince >= runEvery ? 0 : runEvery - daysSince;
+}
+function loadEligibleJobs() {
+    const rows = database_1.db
+        .prepare(`
+    SELECT j.*,
+           a.api_id, a.api_hash, a.session_string, a.auth_status, a.proxy_id AS account_proxy_id,
+           a.name AS account_name, a.phone_number, a.created_at AS account_created_at, a.disabled AS account_disabled,
+           a.app_client_id AS account_app_client_id
+    FROM jobs j
+    LEFT JOIN tg_accounts a ON j.account_id = a.id
+    WHERE j.enabled = 1
+      AND j.retired IS NULL
+      AND (j.account_id IS NULL OR (a.id IS NOT NULL AND a.disabled = 0))
+      AND (
+        (j.job_type NOT IN ('checkin', 'custom', 'autoreg'))
+        OR (a.auth_status = 'authenticated' AND a.session_string IS NOT NULL)
+      )
+  `)
+        .all();
+    return rows.map((row) => ({
+        job: {
+            id: row.id,
+            name: row.name,
+            accountId: row.account_id ?? null,
+            jobType: row.job_type,
+            botUsername: row.bot_username,
+            scheduleWindowStart: row.schedule_window_start,
+            scheduleWindowEnd: row.schedule_window_end,
+            timezone: row.timezone,
+            replyTimeoutMs: row.reply_timeout_ms,
+            retryMax: row.retry_max,
+            enabled: Boolean(row.enabled),
+            createdAt: row.created_at,
+            config: row.config ?? null,
+            startCommand: row.start_command || "/start",
+            checkinButton: row.checkin_button || "签到",
+            runEveryDays: row.run_every_days ?? 1,
+            runEveryDaysMax: row.run_every_days_max ?? null,
+        },
+        account: row.account_id != null
+            ? (() => {
+                // Credentials resolve as a pair: the account's own if complete, else global defaults
+                const ownApiHash = (0, secretColumns_1.decryptSecret)(row.api_hash);
+                const ownCredentials = row.api_id && ownApiHash
+                    ? { apiId: row.api_id, apiHash: ownApiHash }
+                    : null;
+                const credentials = ownCredentials ?? (0, database_1.getDefaultTgApiCredentials)();
+                return {
+                    id: row.account_id,
+                    name: row.account_name,
+                    phoneNumber: row.phone_number,
+                    apiId: credentials?.apiId ?? null,
+                    apiHash: credentials?.apiHash ?? null,
+                    sessionString: (0, secretColumns_1.decryptSecret)(row.session_string),
+                    authStatus: row.auth_status,
+                    proxyId: row.account_proxy_id ?? null,
+                    disabled: Boolean(row.account_disabled),
+                    appClientId: row.account_app_client_id ?? null,
+                    createdAt: row.account_created_at,
+                };
+            })()
+            : null,
+    }));
+}
+async function executeJob(job, account) {
+    await acquireRunSlot();
+    const detailLogs = [];
+    let logId;
+    try {
+        // Re-fetch job settings so changes made after scheduling take effect
+        const freshJob = database_1.db
+            .prepare("SELECT * FROM jobs WHERE id = ?")
+            .get(job.id);
+        if (freshJob) {
+            job = {
+                id: freshJob.id,
+                name: freshJob.name,
+                accountId: freshJob.account_id ?? null,
+                jobType: freshJob.job_type,
+                botUsername: freshJob.bot_username,
+                scheduleWindowStart: freshJob.schedule_window_start,
+                scheduleWindowEnd: freshJob.schedule_window_end,
+                timezone: freshJob.timezone,
+                replyTimeoutMs: freshJob.reply_timeout_ms,
+                retryMax: freshJob.retry_max,
+                enabled: Boolean(freshJob.enabled),
+                createdAt: freshJob.created_at,
+                config: freshJob.config ?? null,
+                startCommand: freshJob.start_command || "/start",
+                checkinButton: freshJob.checkin_button || "签到",
+                templateId: freshJob.template_id ?? null,
+                runEveryDays: freshJob.run_every_days ?? 1,
+                runEveryDaysMax: freshJob.run_every_days_max ?? null,
+            };
+        }
+        const ranAt = new Date().toISOString();
+        logId = database_1.db
+            .prepare("INSERT INTO job_logs (job_id, ran_at, status, message) VALUES (?, ?, 'running', 'Scheduled')")
+            .run(job.id, ranAt).lastInsertRowid;
+        const signal = (0, cancellation_1.registerJob)(Number(logId));
+        (0, cancellation_1.registerLiveDetail)(Number(logId), detailLogs);
+        // Re-fetch session in case it was updated since scheduling
+        if (account) {
+            const fresh = database_1.db
+                .prepare("SELECT session_string FROM tg_accounts WHERE id = ?")
+                .get(account.id);
+            if (fresh?.session_string)
+                account = { ...account, sessionString: (0, secretColumns_1.decryptSecret)(fresh.session_string) };
+        }
+        await (0, runner_1.runJob)(job, account, detailLogs, signal);
+        const detail = detailLogs.length ? JSON.stringify(detailLogs) : null;
+        // Warnings ride along with a successful run: the job completed, so failing it
+        // would be wrong, but the log should say what didn't work.
+        const warnings = (0, runWarnings_1.collectRunWarnings)(job.jobType, detailLogs);
+        database_1.db.prepare("UPDATE job_logs SET status = 'success', message = ?, detail = ? WHERE id = ?").run((0, runWarnings_1.completedMessage)(warnings), detail, logId);
+        if (warnings.length)
+            console.warn(`[scheduler] "${job.name}" completed with warnings: ${warnings.join('; ')}`);
+        // Durable stamp; job_logs is pruned by log_retention_days. Only moves
+        // forward so a slow run finishing after a later one can't rewind it.
+        // Isolated: a failure here must not demote an otherwise successful run.
+        try {
+            database_1.db.prepare(`UPDATE jobs SET last_success_at = ?
+         WHERE id = ? AND (last_success_at IS NULL OR last_success_at < ?)`).run(ranAt, job.id, ranAt);
+        }
+        catch (e) {
+            console.warn(`[scheduler] "${job.name}" last_success_at stamp failed:`, e);
+        }
+        console.log(`[scheduler] "${job.name}" completed`);
+        void (0, notify_1.notifyJobEvent)("success", (0, notify_1.buildSuccessMessage)(job.name, job.jobType, detailLogs), account, undefined, job.jobType);
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const isCancelled = message === "Job cancelled";
+        if (logId !== undefined) {
+            const detail = detailLogs.length ? JSON.stringify(detailLogs) : null;
+            database_1.db.prepare("UPDATE job_logs SET status = 'failed', message = ?, detail = ? WHERE id = ?").run(isCancelled ? "Cancelled" : message, detail, logId);
+        }
+        console.error(`[scheduler] "${job.name}" failed:`, message);
+        if (!isCancelled) {
+            void (0, notify_1.notifyJobEvent)("failed", (0, notify_1.buildFailureMessage)(job.name, job.jobType, message), account);
+        }
+    }
+    finally {
+        releaseRunSlot();
+        if (logId !== undefined) {
+            (0, cancellation_1.unregisterJob)(Number(logId));
+            (0, cancellation_1.clearLiveDetail)(Number(logId));
+        }
+        // Only re-arm the timer if the job still exists and is enabled — a job
+        // disabled or deleted mid-run must not reschedule itself (refreshJobs is
+        // the authority and would otherwise not catch it before the next fire).
+        const current = database_1.db
+            .prepare("SELECT enabled FROM jobs WHERE id = ?")
+            .get(job.id);
+        if (current?.enabled) {
+            scheduleOne(job, account, resolveRunEveryDays(job.id, job.runEveryDays ?? 1, job.runEveryDaysMax));
+        }
+    }
+}
+function scheduleOne(job, account, daysAhead = 0) {
+    const existing = schedule.get(job.id);
+    if (existing)
+        clearTimeout(existing.timer);
+    // Stagger away from every other job's slot so runs don't pile into the
+    // same minute (issue #10)
+    const occupied = Array.from(schedule.values())
+        .filter((entry) => entry.job.id !== job.id)
+        .map((entry) => entry.nextRun.getTime());
+    const timezone = resolveJobTimezone(job.timezone);
+    const nextRun = (0, scheduler_utils_1.pickNextRun)(job.scheduleWindowStart, job.scheduleWindowEnd, timezone, daysAhead, { occupied, gapMinutes: getScheduleGapMinutes() });
+    const delayMs = Math.max(0, nextRun.toMillis() - Date.now());
+    let timer;
+    armLongTimeout(delayMs, () => executeJob(job, account), (t) => {
+        timer = t;
+        const entry = schedule.get(job.id);
+        if (entry)
+            entry.timer = t;
+    });
+    schedule.set(job.id, {
+        job,
+        account,
+        timezone,
+        nextRun: nextRun.toJSDate(),
+        timer,
+    });
+    console.log(`[scheduler] "${job.name}" next run: ${nextRun.toISO()} (in ${Math.round(delayMs / 60000)} min)`);
+}
+function refreshJobs() {
+    const eligible = loadEligibleJobs();
+    const eligibleIds = new Set(eligible.map((e) => e.job.id));
+    // Remove jobs no longer eligible
+    for (const [id, entry] of schedule) {
+        if (!eligibleIds.has(id)) {
+            clearTimeout(entry.timer);
+            schedule.delete(id);
+            console.log(`[scheduler] Unscheduled job ${id}`);
+        }
+    }
+    const dailyCheckOn = checkDailyRunEnabled();
+    // Add newly eligible jobs, or re-schedule if config changed
+    for (const { job, account } of eligible) {
+        const existing = schedule.get(job.id);
+        const resolvedTz = resolveJobTimezone(job.timezone);
+        if (!existing) {
+            const daysAhead = dailyCheckOn
+                ? daysUntilNextRun(job.id, resolvedTz, job.runEveryDays ?? 1, job.runEveryDaysMax)
+                : 0;
+            scheduleOne(job, account, daysAhead);
+        }
+        else {
+            // Compare resolved timezones so a default_timezone change reschedules
+            // jobs that follow the default
+            const scheduleChanged = existing.job.scheduleWindowStart !== job.scheduleWindowStart ||
+                existing.job.scheduleWindowEnd !== job.scheduleWindowEnd ||
+                existing.timezone !== resolvedTz ||
+                existing.job.botUsername !== job.botUsername ||
+                existing.job.accountId !== job.accountId ||
+                existing.job.runEveryDays !== job.runEveryDays ||
+                existing.job.runEveryDaysMax !== job.runEveryDaysMax;
+            if (scheduleChanged) {
+                const daysAhead = dailyCheckOn
+                    ? daysUntilNextRun(job.id, resolvedTz, job.runEveryDays ?? 1, job.runEveryDaysMax)
+                    : 0;
+                scheduleOne(job, account, daysAhead);
+            }
+            else {
+                // Keep the timer but update the stored snapshot so status reflects current settings
+                schedule.set(job.id, { ...existing, job, account });
+            }
+        }
+    }
+}
+function refreshScheduler() {
+    refreshJobs();
+}
+/** Deletes job logs older than the configured retention window. 0 keeps everything. */
+function purgeOldLogs() {
+    const row = database_1.db
+        .prepare("SELECT value FROM settings WHERE key = 'log_retention_days'")
+        .get();
+    const days = Number(row?.value ?? 0);
+    if (!Number.isFinite(days) || days <= 0)
+        return;
+    const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+    const { changes } = database_1.db
+        .prepare("DELETE FROM job_logs WHERE ran_at < ? AND status != 'running'")
+        .run(cutoff);
+    if (changes > 0) {
+        console.log(`[scheduler] Purged ${changes} job log(s) older than ${days} day(s)`);
+    }
+}
+/**
+ * Mark any job_logs still in 'running' state as failed. On a fresh process
+ * start nothing is actually running, so a leftover 'running' row means the
+ * previous process was killed mid-run (e.g. during an upgrade), leaving the
+ * log stuck and un-stoppable. (issue #18)
+ */
+function reconcileOrphanedRuns() {
+    const { changes } = database_1.db
+        .prepare("UPDATE job_logs SET status = 'failed', message = 'Interrupted by server restart' WHERE status = 'running'")
+        .run();
+    if (changes > 0) {
+        console.log(`[scheduler] Marked ${changes} interrupted run(s) as failed`);
+    }
+}
+function startScheduler() {
+    console.log("[scheduler] Starting");
+    reconcileOrphanedRuns();
+    refreshJobs();
+    // Re-check every 5 minutes to pick up new/changed jobs
+    setInterval(refreshJobs, 5 * 60 * 1000);
+    purgeOldLogs();
+    // Retention sweep is cheap, so hourly keeps the table tidy without load
+    setInterval(purgeOldLogs, 60 * 60 * 1000);
+}
+function getSchedulerStatus() {
+    return Array.from(schedule.values()).map(({ job, nextRun }) => ({
+        jobId: job.id,
+        jobName: job.name,
+        jobType: job.jobType,
+        nextRun: nextRun.toISOString(),
+    }));
+}
+/**
+ * Drops a job's pending run and arms the one after it, which is how an operator calls off a
+ * run they can see coming without disabling the job. The job keeps its schedule; only this
+ * occurrence is given up, so the list shows it again on its next eligible day.
+ */
+function skipNextRun(jobId) {
+    const entry = schedule.get(jobId);
+    if (!entry)
+        return { ok: false };
+    // Counted from the pending run's own day, not from today: that run may already be days out
+    // (its window has passed today), and a day counted from today would land on or before it --
+    // rescheduling the very run being called off, sometimes to an earlier minute.
+    const pendingDay = luxon_1.DateTime.fromJSDate(entry.nextRun)
+        .setZone(entry.timezone)
+        .startOf("day");
+    const today = luxon_1.DateTime.now().setZone(entry.timezone).startOf("day");
+    const daysUntilPending = Math.max(0, Math.round(pendingDay.diff(today, "days").days));
+    // Past that day, the next opportunity is one interval on -- one day for a daily job
+    const interval = checkDailyRunEnabled()
+        ? Math.max(1, resolveRunEveryDays(jobId, entry.job.runEveryDays ?? 1, entry.job.runEveryDaysMax))
+        : 1;
+    const daysAhead = daysUntilPending + interval;
+    scheduleOne(entry.job, entry.account, daysAhead);
+    const nextRun = schedule.get(jobId)?.nextRun.toISOString();
+    console.log(`[scheduler] "${entry.job.name}" run skipped by operator; next run: ${nextRun}`);
+    return { ok: true, nextRun };
+}

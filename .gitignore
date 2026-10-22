@@ -1,0 +1,23 @@
+# 运行时数据与数据库（严禁上传）
+data/
+backups/
+*.db
+*.db-shm
+*.db-wal
+*.bak*
+
+# 生产环境密钥与凭据
+.env
+*.key
+*.pem
+*.session
+
+# 临时文件与日志
+*.log
+tmp/
+.DS_Store
+node_modules/
+dist/__tests__/
+public.bak*
+public.orig/
+dist/__tests__/
