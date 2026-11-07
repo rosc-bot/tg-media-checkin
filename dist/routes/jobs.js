@@ -339,7 +339,7 @@ router.post("/:id/run", async (req, res) => {
         const detail = detailLogs.length ? JSON.stringify(detailLogs) : null;
         database_1.db.prepare("UPDATE job_logs SET status = 'failed', message = ?, detail = ? WHERE id = ?").run(isCancelled ? "Cancelled" : message, detail, logId);
         if (!isCancelled) {
-            void (0, notify_1.notifyJobEvent)("failed", (0, notify_1.buildFailureMessage)(job.name, job.jobType, message), account);
+            void (0, notify_1.notifyJobEvent)("failed", (0, notify_1.buildFailureMessage)(job.name, job.jobType, message), account, undefined, job.jobType);
         }
     })
         .finally(() => { (0, cancellation_1.unregisterJob)(Number(logId)); (0, cancellation_1.clearLiveDetail)(Number(logId)); });

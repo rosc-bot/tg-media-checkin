@@ -692,11 +692,37 @@ cfRun = (0, cloudflare_1.newCfRunState)()) {
                                 }
                                 const expanded = (0, checkin_1.expandCommand)(content);
                                 step.label = `Send to ${contact}: "${expanded}"`;
-                                const sentContact = await client.sendMessage(entity, {
+                                const sendParams = {
                                     message: expanded,
-                                });
+                                };
+                                if (action.topicId && Number(action.topicId) !== 1) {
+                                    sendParams.replyTo = Number(action.topicId);
+                                    sendParams.topMsgId = Number(action.topicId);
+                                } else if (action.replyTo) {
+                                    sendParams.replyTo = Number(action.replyTo);
+                                }
+                                const sentContact = await client.sendMessage(entity, sendParams);
                                 contactAnchors.set(contact, anchorFromSent(sentContact));
                                 step.result = "Sent";
+                                if (action.waitReplyMs) {
+                                    const waitMs = Number(action.waitReplyMs) || 10000;
+                                    const myMsgId = sentContact?.id;
+                                    const start = Date.now();
+                                    while (Date.now() - start < waitMs) {
+                                        await new Promise((r) => setTimeout(r, 1500));
+                                        try {
+                                            const recent = await client.getMessages(entity, { limit: 10 });
+                                            const reply = recent.find((m) => m.replyTo?.replyToMsgId === myMsgId);
+                                            if (reply) {
+                                                step.result = reply.text || "Replied";
+                                                step.responseHtml = `<strong>${(0, htmlEscape_1.escapeHtml)(reply.text || "")}</strong>`;
+                                                break;
+                                            }
+                                        } catch {
+                                            /* ignore transient polling errors */
+                                        }
+                                    }
+                                }
                                 break;
                             }
                             case "wait_reply": {
@@ -1956,6 +1982,42 @@ cfRun = (0, cloudflare_1.newCfRunState)()) {
                                     url = resolved.url;
                                     unsigned = !resolved.signed && !carriesAccount;
                                     refresh = async () => (await (0, miniApp_1.openableMiniAppUrl)(client, rawUrl, owner || undefined)).url;
+                                }
+                                if (url.includes("090911.xyz")) {
+                                    const hash = url.split("#")[1] || "";
+                                    const params = new URLSearchParams(hash);
+                                    const initData = params.get("tgWebAppData");
+                                    if (initData) {
+                                        const headers = {
+                                            "Content-Type": "application/json",
+                                            "Origin": "https://user.090911.xyz",
+                                            "Referer": "https://user.090911.xyz/",
+                                            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Telegram-iOS/10.14.1"
+                                        };
+                                        const loginRes = await fetch("https://user.090911.xyz/api/auth/telegram", {
+                                            method: "POST",
+                                            headers,
+                                            body: JSON.stringify({ initData })
+                                        });
+                                        if (!loginRes.ok) {
+                                            throw new Error(`Login failed (${loginRes.status}): ${(await loginRes.text()).slice(0, 100)}`);
+                                        }
+                                        const cookies = loginRes.headers.getSetCookie ? loginRes.headers.getSetCookie() : [loginRes.headers.get("set-cookie")];
+                                        const cookieHeader = (cookies || []).map(c => c ? c.split(";")[0] : "").join("; ");
+                                        const checkinRes = await fetch("https://user.090911.xyz/api/user/checkin", {
+                                            method: "POST",
+                                            headers: { ...headers, "Cookie": cookieHeader },
+                                            body: JSON.stringify({})
+                                        });
+                                        const checkinData = await checkinRes.json();
+                                        step.cfMiniApp = true;
+                                        step.cfMiniAppSigned = true;
+                                        step.cfPassed = true;
+                                        step.cfHost = "user.090911.xyz";
+                                        step.result = checkinData.message || "OK";
+                                        step.responseHtml = `<strong>${checkinData.message || "签到完成"}</strong>${checkinData.data?.newScore ? `<br>当前持有: ${checkinData.data.newScore} 猫币` : ""}`;
+                                        break;
+                                    }
                                 }
                                 const cfHost = (() => {
                                     try {

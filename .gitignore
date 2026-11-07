@@ -21,3 +21,4 @@ dist/__tests__/
 public.bak*
 public.orig/
 dist/__tests__/
+__pycache__/

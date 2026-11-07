@@ -279,7 +279,7 @@ async function executeJob(job, account) {
         }
         console.error(`[scheduler] "${job.name}" failed:`, message);
         if (!isCancelled) {
-            void (0, notify_1.notifyJobEvent)("failed", (0, notify_1.buildFailureMessage)(job.name, job.jobType, message), account);
+            void (0, notify_1.notifyJobEvent)("failed", (0, notify_1.buildFailureMessage)(job.name, job.jobType, message), account, undefined, job.jobType);
         }
     }
     finally {

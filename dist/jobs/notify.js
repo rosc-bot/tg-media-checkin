@@ -184,6 +184,11 @@ async function sendTgNotify(account, message, target = "me") {
  * Never throws: a failed notification must not fail the run that triggered it.
  */
 async function notifyJobEvent(event, message, account, target, jobType) {
+    // 只有观影保活 (embywatch) 正常推送成功或失败
+    // 签到任务 (checkin / custom) 单次通知全部静音，由每日 20:05 签到总日报汇总推送
+    if (jobType !== "embywatch") {
+        return;
+    }
     const cfg = getNotifyConfig();
     const shouldNotify = cfg.events.includes(event) || (event === "success" && jobType === "embywatch");
     if (!shouldNotify)

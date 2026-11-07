@@ -800,7 +800,7 @@ async function available(serverUrl, ctx, seg) {
 /** A bounded random sample of a library's Series/Movies (no full enumeration). */
 async function librarySample(serverUrl, ctx, parentId, limit) {
     try {
-        const page = await embyRequest(serverUrl, `/Users/${ctx.userId}/Items?ParentId=${parentId}&Recursive=true&IncludeItemTypes=Series,Movie&SortBy=Random&Limit=${limit}&Fields=MediaSources,RunTimeTicks`, reqOpts(ctx));
+        const page = await embyRequest(serverUrl, `/Users/${ctx.userId}/Items?ParentId=${parentId}&Recursive=true&IncludeItemTypes=Series,Movie&SortBy=Random&Limit=${limit}&Fields=RunTimeTicks`, reqOpts(ctx));
         return page.Items ?? [];
     }
     catch {
@@ -812,7 +812,7 @@ async function librarySample(serverUrl, ctx, parentId, limit) {
 async function memberToSegment(serverUrl, ctx, member) {
     if (member.Type !== 'Series')
         return toSegment(member);
-    const eps = await embyRequest(serverUrl, `/Shows/${member.Id}/Episodes?UserId=${ctx.userId}&Fields=MediaSources,RunTimeTicks`, reqOpts(ctx));
+    const eps = await embyRequest(serverUrl, `/Shows/${member.Id}/Episodes?UserId=${ctx.userId}&Fields=RunTimeTicks`, reqOpts(ctx));
     const list = eps.Items ?? [];
     if (!list.length)
         return undefined;
@@ -888,7 +888,7 @@ async function itemInLibrary(serverUrl, ctx, item, libraryId, cache) {
 async function libraryResumeSegment(serverUrl, ctx, parentId, verifyPlayable) {
     let res;
     try {
-        res = await embyRequest(serverUrl, `/Users/${ctx.userId}/Items/Resume?Limit=25&MediaTypes=Video&Recursive=true&Fields=MediaSources,RunTimeTicks,UserData,ParentId,SeriesId`, reqOpts(ctx));
+        res = await embyRequest(serverUrl, `/Users/${ctx.userId}/Items/Resume?Limit=25&MediaTypes=Video&Recursive=true&Fields=RunTimeTicks,UserData,ParentId,SeriesId`, reqOpts(ctx));
     }
     catch {
         throwIfAborted(ctx.signal);
@@ -912,7 +912,7 @@ async function pickRandomSegment(serverUrl, ctx, verifyPlayable, parentId) {
     const attempts = verifyPlayable ? MAX_PICK_ATTEMPTS : 1;
     const scope = parentId ? `&ParentId=${parentId}` : '';
     for (let attempt = 1; attempt <= attempts; attempt++) {
-        const items = await embyRequest(serverUrl, `/Users/${ctx.userId}/Items?SortBy=Random&Limit=1&IncludeItemTypes=Episode,Movie&Recursive=true&Fields=MediaSources,RunTimeTicks${scope}`, reqOpts(ctx));
+        const items = await embyRequest(serverUrl, `/Users/${ctx.userId}/Items?SortBy=Random&Limit=1&IncludeItemTypes=Episode,Movie&Recursive=true&Fields=RunTimeTicks${scope}`, reqOpts(ctx));
         if (!items.Items?.length)
             return undefined;
         const seg = toSegment(items.Items[0]);
@@ -927,7 +927,7 @@ async function pickRandomSegment(serverUrl, ctx, verifyPlayable, parentId) {
 async function getNextEpisode(serverUrl, ctx, item, verifyPlayable) {
     if (item.Type !== 'Episode' || !item.SeriesId)
         return undefined;
-    const eps = await embyRequest(serverUrl, `/Shows/${item.SeriesId}/Episodes?UserId=${ctx.userId}&Fields=MediaSources,RunTimeTicks`, reqOpts(ctx));
+    const eps = await embyRequest(serverUrl, `/Shows/${item.SeriesId}/Episodes?UserId=${ctx.userId}&Fields=RunTimeTicks`, reqOpts(ctx));
     const list = eps.Items ?? [];
     const idx = list.findIndex(e => e.Id === item.Id);
     if (idx < 0 || idx + 1 >= list.length)
@@ -971,11 +971,11 @@ async function runSequencePlay(serverUrl, ctx, config, opts) {
     };
     // Whole-server selection (no library scope): resume → next up → random.
     const pickWholeServer = async () => {
-        const resume = await embyRequest(serverUrl, `/Users/${ctx.userId}/Items/Resume?Limit=10&MediaTypes=Video&Recursive=true&Fields=MediaSources,RunTimeTicks`, reqOpts(ctx));
+        const resume = await embyRequest(serverUrl, `/Users/${ctx.userId}/Items/Resume?Limit=10&MediaTypes=Video&Recursive=true&Fields=RunTimeTicks`, reqOpts(ctx));
         let seg = await firstPlayable(serverUrl, ctx, resume.Items ?? [], verifyPlayable);
         if (seg)
             return asResume(seg);
-        const nextUp = await embyRequest(serverUrl, `/Shows/NextUp?UserId=${ctx.userId}&Limit=10&Fields=MediaSources,RunTimeTicks`, reqOpts(ctx));
+        const nextUp = await embyRequest(serverUrl, `/Shows/NextUp?UserId=${ctx.userId}&Limit=10&Fields=RunTimeTicks`, reqOpts(ctx));
         seg = await firstPlayable(serverUrl, ctx, nextUp.Items ?? [], verifyPlayable);
         if (seg) {
             console.log(`[embywatch] Sequence Play: starting Next Up "${seg.item.Name}"`);

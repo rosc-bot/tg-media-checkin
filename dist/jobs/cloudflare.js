@@ -903,21 +903,37 @@ async function inAppQuestion(page) {
     })
         .catch(() => "");
 }
-/** Solves the arithmetic captchas mini apps use ("5 + 3 = ?"). */
+/** Solves the arithmetic captchas mini apps and bots use ("5 + 3 = ?", "1 − 1 = ?"). */
 function solveArithmetic(text) {
-    const m = text.match(/(-?\d+)\s*([+\-*x×÷/])\s*(-?\d+)\s*(?:=\s*[?？]?|[?？])/);
+    if (!text)
+        return undefined;
+    if (/(?:签到|打卡)成功|已经?签到|请勿重复|获得(?:积分|.*币)|当前(?:持有|余额)|已延长/i.test(text))
+        return undefined;
+    const normalized = text
+        .replace(/[\u2212\uFE63\uFF0D\u2013\u2014]/g, "-")
+        .replace(/[\uFF0B]/g, "+")
+        .replace(/[\uFF1D]/g, "=")
+        .replace(/[\uFF1F]/g, "?")
+        .replace(/×/g, "*")
+        .replace(/÷/g, "/")
+        .replace(/除以/g, "/");
+    let m = normalized.match(/(?:(?:请?计算|验证码|问题|captcha)[：:\s]*)?(?<![\d-])(\d+)\s*([-+*xX/加减乘除])\s*(\d+)\s*(?:=\s*[?]?|[?]|等于\s*[?]?|等于几|是多少)/i);
     if (!m)
         return undefined;
     const a = Number(m[1]);
+    const op = m[2];
     const b = Number(m[3]);
-    switch (m[2]) {
-        case "+": return String(a + b);
-        case "-": return String(a - b);
-        case "*":
-        case "x":
-        case "×": return String(a * b);
-        default: return b === 0 ? undefined : String(a / b);
-    }
+    if (isNaN(a) || isNaN(b))
+        return undefined;
+    if (op === "+" || op === "加")
+        return String(a + b);
+    if (op === "-" || op === "减")
+        return String(a - b);
+    if (op === "*" || op.toLowerCase() === "x" || op === "乘")
+        return String(a * b);
+    if (op === "/" || op === "除")
+        return b === 0 ? undefined : String(Math.floor(a / b));
+    return undefined;
 }
 // Types an answer into the app's visible input, preferring one inside the open dialog.
 async function fillInAppAnswer(page, answer) {

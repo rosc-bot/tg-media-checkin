@@ -941,7 +941,7 @@ cfRun = (0, cloudflare_1.newCfRunState)()) {
                     // 有些机器人（如 @Lewa_user_bot）签到是异步的：回调只回一句"签到中..."，
                     // 真实结果 1~2 分钟后才"编辑"到原消息上。原逻辑对"已有 toast"的情况只等 5 秒，
                     // 必然漏掉这类结果 → 假失败。改为等待完整的 replyTimeoutMs。
-                    const capMs = Math.min(replyTimeoutMs, answer?.message ? 150000 : 30000);
+                    const capMs = Math.min(replyTimeoutMs, 150000);
                     const capPromise = new Promise(r => setTimeout(() => r({ msg: null, src: 'cap' }), capMs));
                     // Take whichever response arrives first; track the source for dev logs
                     const t_resp = Date.now();
@@ -972,12 +972,60 @@ cfRun = (0, cloudflare_1.newCfRunState)()) {
                         const arithmeticAnswer = (0, cloudflare_1.solveArithmetic)(combinedText);
                         if (arithmeticAnswer && !urlToOpen) {
                             console.log(`[checkin] detected arithmetic question in response, solving: answer="${arithmeticAnswer}"`);
-                            await client.sendMessage(botUsername, { message: arithmeticAnswer });
-                            const nextReply = await (0, exports.waitForNewBotMessage)(client, botUsername, 10000, signal).catch(() => null);
-                            if (nextReply) {
-                                const nextBp = await (0, exports.parseMessages)([nextReply], client, signal);
-                                if (nextBp.html) {
-                                    log.buttonResponseHtml = (log.buttonResponseHtml ? log.buttonResponseHtml + '<br>' : '') + nextBp.html;
+                            let buttonClicked = false;
+                            if (responseMsg?.replyMarkup?.rows && responseMsg.id) {
+                                const ansStr = String(arithmeticAnswer).trim();
+                                for (const row of responseMsg.replyMarkup.rows) {
+                                    for (const b of (row.buttons || [])) {
+                                        const bText = (b.text || '').trim();
+                                        if ((bText === ansStr || bText.includes(ansStr)) && b instanceof telegram_1.Api.KeyboardButtonCallback) {
+                                            console.log(`[checkin] clicking arithmetic callback button "${bText}" on msgId=${responseMsg.id}`);
+                                            const editPromise2 = (0, exports.waitForBotMessageEdit)(client, responseMsg.id, replyTimeoutMs, signal, botPeerId);
+                                            const newMsgPromise2 = (0, exports.waitForNewBotMessage)(client, botUsername, replyTimeoutMs, signal);
+                                            await new Promise(r => setTimeout(r, 1000));
+                                            let mathCbAnswer = null;
+                                            try {
+                                                mathCbAnswer = await client.invoke(new telegram_1.Api.messages.GetBotCallbackAnswer({
+                                                    peer,
+                                                    msgId: responseMsg.id,
+                                                    data: b.data,
+                                                }));
+                                            }
+                                            catch (err) {
+                                                if (!err?.message?.includes('BOT_RESPONSE_TIMEOUT'))
+                                                    throw err;
+                                            }
+                                            if (mathCbAnswer?.message) {
+                                                log.callbackAnswer = (log.callbackAnswer ? log.callbackAnswer + ' | ' : '') + mathCbAnswer.message;
+                                            }
+                                            const capPromise2 = new Promise(r => setTimeout(() => r({ msg: null, src: 'cap' }), Math.min(replyTimeoutMs, 15000)));
+                                            const { msg: finalMsg } = await Promise.race([
+                                                editPromise2.then(m => ({ msg: m, src: 'edit' })),
+                                                newMsgPromise2.then(m => ({ msg: m, src: 'new_message' })),
+                                                capPromise2
+                                            ]);
+                                            if (finalMsg) {
+                                                const finalBp = await (0, exports.parseMessages)([finalMsg], client, signal);
+                                                if (finalBp.html) {
+                                                    log.buttonResponseHtml = (log.buttonResponseHtml ? log.buttonResponseHtml + '<br>' : '') + finalBp.html;
+                                                }
+                                            }
+                                            buttonClicked = true;
+                                            break;
+                                        }
+                                    }
+                                    if (buttonClicked)
+                                        break;
+                                }
+                            }
+                            if (!buttonClicked) {
+                                await client.sendMessage(botUsername, { message: arithmeticAnswer });
+                                const nextReply = await (0, exports.waitForNewBotMessage)(client, botUsername, 10000, signal).catch(() => null);
+                                if (nextReply) {
+                                    const nextBp = await (0, exports.parseMessages)([nextReply], client, signal);
+                                    if (nextBp.html) {
+                                        log.buttonResponseHtml = (log.buttonResponseHtml ? log.buttonResponseHtml + '<br>' : '') + nextBp.html;
+                                    }
                                 }
                             }
                         }
@@ -991,7 +1039,7 @@ cfRun = (0, cloudflare_1.newCfRunState)()) {
                             .then(r => r?.[0] ?? null)
                             .catch(() => null);
                         const freshEditDate = fresh?.editDate;
-                        const wasEdited = !!fresh && !!freshEditDate && freshEditDate !== preClickEditDate;
+                        const wasEdited = !!fresh && ((!!freshEditDate && freshEditDate !== preClickEditDate) || (fresh?.message && fresh.message !== buttonsMsg.message));
                         if (!wasEdited) {
                             throw new Error(`Button "${btnText}" click timed out (BOT_RESPONSE_TIMEOUT) with no response`);
                         }

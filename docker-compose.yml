@@ -1,11 +1,11 @@
-name: bemby
+name: tg-media-checkin
 services:
-  bemby:
+  tg-media-checkin:
     image: liveinaus/bemby:latest
-    container_name: bemby
+    container_name: tg-media-checkin
     restart: unless-stopped
     ports:
-      - 0.0.0.0:8648:3000
+      - 127.0.0.1:3100:3000
     volumes:
       - ./data:/app/data
       - ./dist:/app/dist
