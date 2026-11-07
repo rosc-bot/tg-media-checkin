@@ -791,6 +791,10 @@ cfRun = (0, cloudflare_1.newCfRunState)()) {
         // 只查 callbackAnswer 会漏判 → 假失败。两处合起来判断。
         if (/已签到|已經簽到|已经签到过|已經簽到過|already/i.test((log.callbackAnswer ?? '') + '\n' + joined))
             return;
+        // 看图验证码：机器人要求在规定秒数内点击图中事物。没点成就是失败，
+        // 不能因为没配 successContains 就当成成功（曾出现连续多天假成功）。
+        if (/点击图中|點擊圖中|秒内点击|秒內點擊/.test(joined))
+            throw new Error('机器人要求看图验证码，但未完成按钮点击（当天签到机会已消耗）；请检查 AI 看图选按钮是否生效');
         if (failContains && joined.includes(failContains)) {
             throw new Error(`Reply indicates failure: "${failContains}" detected`);
         }
@@ -864,6 +868,8 @@ cfRun = (0, cloudflare_1.newCfRunState)()) {
             const aiResult = await selectButtonWithAI(log.availableButtons, log.commandResponseHtml, parsed.images, hint, maxAiRetries);
             targetText = aiResult.button;
             log.aiDurationMs = Date.now() - aiStart;
+            log.aiImages = parsed.images.length;
+            console.log(`[checkin] AI 选按钮: "${aiResult.button}" | 图片 ${parsed.images.length} 张 | ${log.aiDurationMs}ms | 回复: ${String(aiResult.response || '').slice(0, 40)}`);
             log.aiPrompt = aiResult.prompt;
             log.aiResponse = aiResult.response;
             if (aiResult.retries.length)
