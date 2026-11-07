@@ -4,6 +4,16 @@
 
 ---
 
+## 🖼️ 界面预览
+
+| 登录页 | 任务调度（示例数据已打码） |
+| :---: | :---: |
+| ![登录页](docs/screenshots/01-login.png) | ![任务调度](docs/screenshots/02-dashboard.png) |
+
+| 任务模板中心 |
+| :---: |
+| ![任务模板](docs/screenshots/03-templates.png) |
+
 ## ✨ 核心特性
 
 - 📱 **Telegram 机器人自动化签到**
